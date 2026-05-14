@@ -5,6 +5,7 @@ import { setLogLevel, createLogger, c, shouldUseColor } from "./core/logger.ts"
 import { createSpinner, createProgressSpinner, spinnerLog } from "./core/spinner.ts"
 import { ALL_ADAPTERS, type AdapterName, createAdapter, isAdapterName } from "./adapters/registry.ts"
 import { resolveAdapterConfigMode } from "./core/config.ts"
+import { assertKnownFlags } from "./core/cli-flags.ts"
 
 const noColor = (s: string) => s
 import { CLI_DEFAULTS, MODEL_DEFAULTS } from "./core/ui-defaults.ts"
@@ -140,7 +141,21 @@ function printProfileSummary(tcp: import("./core/types.ts").TCP) {
   }
 }
 
+const PROFILE_KNOWN_FLAGS: ReadonlySet<string> = new Set([
+  "model",
+  "adapter",
+  "primitives",
+  "skip",
+  "instances",
+  "force",
+  "list",
+  "batch",
+  "concurrency",
+  "adapter-config",
+])
+
 async function runProfile(flags: Record<string, string>) {
+  assertKnownFlags("profile", flags, PROFILE_KNOWN_FLAGS)
   if (flags.help === "true") {
     console.log(`skvm profile - Profile a model's primitive capabilities
 
@@ -348,7 +363,19 @@ Options:
   }
 }
 
+const RUN_KNOWN_FLAGS: ReadonlySet<string> = new Set([
+  "task",
+  "skill",
+  "model",
+  "adapter",
+  "workdir",
+  "timeoutMs",
+  "maxSteps",
+  "adapter-config",
+])
+
 async function runRun(flags: Record<string, string>) {
+  assertKnownFlags("run", flags, RUN_KNOWN_FLAGS)
   if (flags.help === "true") {
     console.log(`skvm run - Run one task with an optional user-specified skill
 
@@ -492,7 +519,20 @@ Notes:
   }
 }
 
+const COMPILE_KNOWN_FLAGS: ReadonlySet<string> = new Set([
+  "skill",
+  "model",
+  "adapter",
+  "profile",
+  "pass",
+  "list-passes",
+  "concurrency",
+  "dry-run",
+  "compiler-model",
+])
+
 async function runCompile(flags: Record<string, string>) {
+  assertKnownFlags("aot-compile", flags, COMPILE_KNOWN_FLAGS)
   if (flags.help === "true") {
     console.log(`skvm aot-compile - AOT-compile skill(s) for target model(s)
 
@@ -726,7 +766,20 @@ Options:
   }
 }
 
+const PIPELINE_KNOWN_FLAGS: ReadonlySet<string> = new Set([
+  "skill",
+  "model",
+  "adapter",
+  "force-profile",
+  "profile",
+  "pass",
+  "compiler-model",
+  "dry-run",
+  "adapter-config",
+])
+
 async function runPipeline(flags: Record<string, string>) {
+  assertKnownFlags("pipeline", flags, PIPELINE_KNOWN_FLAGS)
   if (flags.help === "true") {
     console.log(`skvm pipeline - Profile (if needed) then compile a skill for a target model
 
@@ -909,7 +962,16 @@ async function runBenchCmd(flags: Record<string, string>) {
   await runBench(flags)
 }
 
+const CLEAN_JIT_KNOWN_FLAGS: ReadonlySet<string> = new Set([
+  "model",
+  "adapter",
+  "dry-run",
+  "yes",
+  "include-bench-logs",
+])
+
 async function runCleanJIT(flags: Record<string, string>) {
+  assertKnownFlags("clean-jit", flags, CLEAN_JIT_KNOWN_FLAGS)
   if (flags.help === "true") {
     console.log(`skvm clean-jit - Clear persisted JIT artifacts for a model+adapter
 
@@ -1107,7 +1169,14 @@ Notes:
 // Command: logs
 // ---------------------------------------------------------------------------
 
+const LOGS_KNOWN_FLAGS: ReadonlySet<string> = new Set([
+  "type",
+  "limit",
+  "all",
+])
+
 async function runLogs(flags: Record<string, string>) {
+  assertKnownFlags("logs", flags, LOGS_KNOWN_FLAGS)
   if (flags.help === "true") {
     console.log(`skvm logs - List recent runs across all subsystems
 
@@ -1161,10 +1230,28 @@ Options:
 // Command: proposals
 // ---------------------------------------------------------------------------
 
+const PROPOSALS_KNOWN_FLAGS: Record<string, ReadonlySet<string>> = {
+  list:   new Set(["harness", "target-model", "model", "skill", "status",
+                   "sort", "min-delta", "group-by", "no-color"]),
+  show:   new Set(["full", "no-color"]),
+  diff:   new Set(["round"]),
+  report: new Set(["harness", "target-model", "model", "skill", "status",
+                   "sort", "min-delta", "group-by", "out"]),
+  serve:  new Set(["port", "host", "no-open"]),
+  accept: new Set(["target", "round"]),
+  reject: new Set([]),
+  cancel: new Set([]),
+}
+
 async function runProposals(rawArgs: string[]) {
   const sub = rawArgs[0]
   const flags = parseFlags(rawArgs.slice(1))
   const positional = rawArgs.slice(1).filter((a) => !a.startsWith("--"))
+
+  if (sub && sub !== "help") {
+    const allowed = PROPOSALS_KNOWN_FLAGS[sub] ?? new Set<string>()
+    assertKnownFlags(`proposals ${sub}`, flags, allowed)
+  }
 
   if (!sub || sub === "help" || flags.help === "true") {
     console.log(`skvm proposals - Manage jit-optimize proposals
@@ -1465,7 +1552,32 @@ Proposals root: $SKVM_PROPOSALS_DIR or ~/.skvm/proposals by default.`)
 // Command: jit-optimize
 // ---------------------------------------------------------------------------
 
+const JIT_OPTIMIZE_KNOWN_FLAGS: ReadonlySet<string> = new Set([
+  // Skill selection
+  "skill", "skill-list",
+  // Source kind + per-source inputs
+  "task-source",
+  "synthetic-count", "synthetic-test-count",
+  "tasks", "test-tasks",
+  "logs", "failures",
+  // Target & optimizer
+  "optimizer-model", "compiler-model",
+  "target-model", "target-adapter",
+  "model", "adapter",          // deprecated aliases — see runJitOptimize
+  // Loop
+  "rounds", "runs-per-task", "task-concurrency", "convergence", "baseline",
+  // Delivery
+  "no-keep-all-rounds", "auto-apply",
+  // Batch
+  "concurrency",
+  // Adapter mode
+  "adapter-config",
+  // Detached invocation
+  "detach",
+])
+
 async function runJitOptimize(flags: Record<string, string>) {
+  assertKnownFlags("jit-optimize", flags, JIT_OPTIMIZE_KNOWN_FLAGS)
   if (flags.help === "true") {
     console.log(`skvm jit-optimize - Optimize a skill based on execution evidence
 
