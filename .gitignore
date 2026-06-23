@@ -21,6 +21,13 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .env.test.local
 .env.production.local
 .env.local
+*.env
+
+# scratch / experiment artifacts (harbor jobs, env files, smoke runs)
+temp/
+
+# terminal-bench repo clone (independent git repo, 3rd-party, large)
+terminal-bench-2-1/
 
 # caches
 .eslintcache
