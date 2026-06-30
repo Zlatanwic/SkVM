@@ -6,6 +6,8 @@
  * (~64 KB on macOS) while the parent blocks on `proc.exited`.
  */
 
+import { existsSync } from "node:fs"
+
 export interface SubprocessResult {
   exitCode: number
   stdout: string
@@ -26,6 +28,25 @@ export interface SubprocessOptions {
   env?: Record<string, string | undefined>
 }
 
+/**
+ * On Windows under Git Bash / MSYS, `which <name>` returns MSYS drive paths
+ * (`/d/...`) that `Bun.spawn` cannot resolve (it expects `D:\\...` or `D:/...`).
+ * Adapter `tierGlobal` resolvers feed that path straight back as `cmd[0]`,
+ * producing `ENOENT uv_spawn`. Convert MSYS drive paths to Windows paths and,
+ * if the bare path doesn't exist, try `.exe` (e.g. `pi` → `pi.exe`, the
+ * bun-compiled binary in `node_modules/.bin`). No-op on non-win32 and for bare
+ * command names (`bash`, `docker`, ...) that Bun resolves via PATH.
+ */
+function resolveCmd0ForSpawn(cmd0: string): string {
+  if (process.platform !== "win32") return cmd0
+  const m = /^\/([a-zA-Z])\/(.*)$/.exec(cmd0)
+  if (!m) return cmd0
+  const win = `${m[1]!.toUpperCase()}:/${m[2]}`
+  if (existsSync(win)) return win
+  if (existsSync(win + ".exe")) return win + ".exe"
+  return win
+}
+
 export async function runSubprocess(
   cmd: string[],
   opts?: SubprocessOptions,
@@ -34,7 +55,10 @@ export async function runSubprocess(
     ? mergeEnv(process.env, opts.env)
     : process.env
   const start = Date.now()
-  const proc = Bun.spawn(cmd, {
+  const spawnCmd = cmd.length > 0
+    ? [resolveCmd0ForSpawn(cmd[0]!), ...cmd.slice(1)]
+    : cmd
+  const proc = Bun.spawn(spawnCmd, {
     cwd: opts?.cwd,
     stdout: "pipe",
     stderr: "pipe",
