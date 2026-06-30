@@ -9,7 +9,7 @@ import type {
 } from "../core/types.ts"
 import { createLogger } from "../core/logger.ts"
 import { getAdapterRepoDir, getAdapterSettings } from "../core/config.ts"
-import { envForRoute, resolveRoute, validateModelIdForRoute } from "../providers/registry.ts"
+import { envForRoute, resolveRoute, resolveBackendModel, validateModelIdForRoute } from "../providers/registry.ts"
 import { runSubprocess } from "../core/subprocess.ts"
 import { subprocessVerdict } from "./subprocess-verdict.ts"
 import { TASK_FILE_DEFAULTS } from "../core/ui-defaults.ts"
@@ -25,6 +25,7 @@ import {
   piEventsToRunRecord,
   toPiModel,
   renderPiBaseUrlOverride,
+  renderPiModelRegistration,
 } from "../core/pi-runtime.ts"
 
 const log = createLogger("pi")
@@ -186,7 +187,16 @@ export class PiAdapter implements AgentAdapter {
       // is needed to redirect the endpoint. Auth flows in via env vars derived
       // from the route — no auth.json needed.
       const route = resolveRoute(config.model)
-      const doc = renderPiBaseUrlOverride(route)
+      // For openai-compatible routes (DeepSeek, vLLM, any OpenAI proxy), the
+      // baseUrl-only override is NOT enough: pi's `openai` provider defaults
+      // custom models to `openai-responses` (POST {baseUrl}/responses), which
+      // non-OpenAI backends don't implement -> 404. Register the model
+      // explicitly with `api: openai-completions` so pi uses /chat/completions.
+      // Matches the headless library driver's behavior (see pi-runtime.ts).
+      const modelId = resolveBackendModel(config.model)
+      const doc = route.kind === "openai-compatible"
+        ? renderPiModelRegistration(route, modelId)
+        : renderPiBaseUrlOverride(route)
       if (doc) await Bun.write(path.join(root, "models.json"), doc)
     }
 
