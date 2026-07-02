@@ -21,8 +21,7 @@ import {
   type Sandbox,
 } from "../core/adapter-sandbox.ts"
 import {
-  parsePiNDJSON,
-  piEventsToRunRecord,
+  piBuildRunRecordFromNDJSON,
   toPiModel,
   renderPiBaseUrlOverride,
   renderPiModelRegistration,
@@ -279,8 +278,7 @@ export class PiAdapter implements AgentAdapter {
       }
     }
 
-    const events = parsePiNDJSON(stdout)
-    const builder = piEventsToRunRecord(events)
+    const builder = piBuildRunRecordFromNDJSON(stdout)
 
     if (task.skill && skillLoaded === false) {
       const skillSnippet = task.skill.content.replace(/^#.*\n/m, "").trim().slice(0, 60)
