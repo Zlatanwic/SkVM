@@ -22,6 +22,7 @@ import {
 } from "../core/adapter-sandbox.ts"
 import {
   piBuildRunRecordFromNDJSON,
+  piBuildRunRecordFromFile,
   toPiModel,
   renderPiBaseUrlOverride,
   renderPiModelRegistration,
@@ -256,10 +257,16 @@ export class PiAdapter implements AgentAdapter {
     const envOverlay: Record<string, string> = { ...this.routeEnv }
     if (this.piAgentDir) envOverlay.PI_CODING_AGENT_DIR = this.piAgentDir
 
+    // Stream pi's NDJSON stdout straight to the convLog file instead of
+    // buffering it (agentic transcripts reach 0.3–1.7 GB → OOM). When a
+    // convLog path exists, streaming IS the convLog write; the file parser
+    // then reads it back. No convLog → fall back to the string path.
+    const convLogPath = task.convLog?.filePath
     const { stdout, stderr, exitCode, timedOut } = await runSubprocess(cmd, {
       cwd: task.workDir,
       timeoutMs: task.timeoutMs ?? this.timeoutMs,
       env: envOverlay,
+      stdoutSink: convLogPath,
     })
 
     const durationMs = performance.now() - startMs
@@ -268,17 +275,9 @@ export class PiAdapter implements AgentAdapter {
       log.warn(`pi exited with code ${exitCode}: ${stderr.slice(0, 200)}`)
     }
 
-    if (task.convLog && stdout.trim()) {
-      try {
-        const destDir = path.dirname(task.convLog.filePath)
-        await mkdir(destDir, { recursive: true })
-        await Bun.write(task.convLog.filePath, stdout)
-      } catch (err) {
-        log.warn(`Failed to save pi NDJSON: ${err}`)
-      }
-    }
-
-    const builder = piBuildRunRecordFromNDJSON(stdout)
+    const builder = convLogPath
+      ? await piBuildRunRecordFromFile(convLogPath)
+      : piBuildRunRecordFromNDJSON(stdout)
 
     if (task.skill && skillLoaded === false) {
       const skillSnippet = task.skill.content.replace(/^#.*\n/m, "").trim().slice(0, 60)

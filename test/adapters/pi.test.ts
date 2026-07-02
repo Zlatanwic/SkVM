@@ -7,6 +7,7 @@ import {
   parsePiNDJSON,
   piEventsToRunRecord,
   piBuildRunRecordFromNDJSON,
+  piBuildRunRecordFromFile,
   renderPiBaseUrlOverride,
   renderPiModelRegistration,
   type PiEvent,
@@ -319,8 +320,8 @@ describe("piBuildRunRecordFromNDJSON", () => {
   // Helpers to build NDJSON with the streaming-delta noise pi actually emits
   // (message_update / thinking / *_delta make up ~99.9% of a real transcript).
   const assistantMsg = (text: string, stopReason: "stop" | "toolUse" = "stop", usage?: Partial<{ input: number; output: number }>) => ({
-    role: "assistant",
-    content: [{ type: "text", text }],
+    role: "assistant" as const,
+    content: [{ type: "text" as const, text }],
     api: "openai", provider: "openai", model: "gpt-4o",
     usage: { input: usage?.input ?? 1, output: usage?.output ?? 1, cacheRead: 0, cacheWrite: 0, totalTokens: (usage?.input ?? 1) + (usage?.output ?? 1), cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
     stopReason, timestamp: 2000,
@@ -425,6 +426,107 @@ describe("piBuildRunRecordFromNDJSON", () => {
     // Tool call wiring survived the streaming parse
     expect(newPath.steps[0]!.toolCalls[0]!.name).toBe("bash")
     expect(newPath.steps[0]!.toolCalls[0]!.output).toBe("file1")
+  })
+})
+
+describe("piBuildRunRecordFromFile", () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(path.join(tmpdir(), "pi-fromfile-test-"))
+  })
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true })
+  })
+
+  // Shared helpers (mirror of the string-path describe above) so the file
+  // path exercises the same fixtures the string path was validated against.
+  const assistantMsg = (text: string, stopReason: "stop" | "toolUse" = "stop", usage?: Partial<{ input: number; output: number }>) => ({
+    role: "assistant" as const,
+    content: [{ type: "text" as const, text }],
+    api: "openai", provider: "openai", model: "gpt-4o",
+    usage: { input: usage?.input ?? 1, output: usage?.output ?? 1, cacheRead: 0, cacheWrite: 0, totalTokens: (usage?.input ?? 1) + (usage?.output ?? 1), cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason, timestamp: 2000,
+  })
+
+  const noiseLines = (n: number): string[] =>
+    Array.from({ length: n }, (_, i) =>
+      JSON.stringify({ type: "message_update", message: assistantMsg(`partial ${i}`) }),
+    )
+
+  test("equivalent to piBuildRunRecordFromNDJSON on identical content", async () => {
+    const events: PiEvent[] = [
+      { type: "agent_start" },
+      { type: "message_end", message: assistantMsg("Hello there!") },
+      { type: "agent_end", messages: [assistantMsg("Hello there!")] },
+    ]
+    const ndjson = events.map((e) => JSON.stringify(e)).join("\n")
+    const file = path.join(tmpDir, "clean.ndjson")
+    await Bun.write(file, ndjson)
+
+    const fromStr = piBuildRunRecordFromNDJSON(ndjson).finish({ workDir: "/tmp", durationMs: 100 })
+    const fromFile = (await piBuildRunRecordFromFile(file)).finish({ workDir: "/tmp", durationMs: 100 })
+
+    expect(fromFile.text).toBe(fromStr.text)
+    expect(fromFile.steps.length).toBe(fromStr.steps.length)
+    expect(fromFile.tokens).toEqual(fromStr.tokens)
+    expect(fromFile.runStatus).toBe(fromStr.runStatus)
+  })
+
+  test("skips message_update noise and retains agent_end (5000-line OOM pattern) from file", async () => {
+    const lines = [
+      '{"type":"session","version":3,"id":"s","timestamp":"t","cwd":"/tmp"}',
+      '{"type":"agent_start"}',
+      ...noiseLines(5000),
+      JSON.stringify({ type: "agent_end", messages: [assistantMsg("final answer", "stop", { input: 7, output: 9 })] }),
+    ]
+    const file = path.join(tmpDir, "noisy.ndjson")
+    await Bun.write(file, lines.join("\n"))
+
+    const result = (await piBuildRunRecordFromFile(file)).finish({ workDir: "/tmp", durationMs: 100 })
+    expect(result.text).toBe("final answer")
+    expect(result.steps.length).toBe(1)
+    expect(result.tokens.input).toBe(7)
+    expect(result.tokens.output).toBe(9)
+    expect(result.runStatus).toBe("ok")
+  })
+
+  test("falls back to message_end when agent_end absent (killed-task case) from file", async () => {
+    const lines = [
+      ...noiseLines(3000),
+      JSON.stringify({ type: "message_end", message: assistantMsg("partial recovery") }),
+    ]
+    const file = path.join(tmpDir, "killed.ndjson")
+    await Bun.write(file, lines.join("\n"))
+
+    const fromStr = piBuildRunRecordFromNDJSON(lines.join("\n")).finish({ workDir: "/tmp", durationMs: 100 })
+    const fromFile = (await piBuildRunRecordFromFile(file)).finish({ workDir: "/tmp", durationMs: 100 })
+
+    expect(fromFile.text).toBe("partial recovery")
+    expect(fromFile.steps.length).toBe(1)
+    expect(fromFile.runStatus).toBe(fromStr.runStatus)
+  })
+
+  test("empty file yields parse-failed", async () => {
+    const file = path.join(tmpDir, "empty.ndjson")
+    await Bun.write(file, "\n\n")
+
+    const r = (await piBuildRunRecordFromFile(file)).finish({ workDir: "/tmp", durationMs: 0 })
+    expect(r.text).toBe("")
+    expect(r.steps).toEqual([])
+    expect(r.runStatus).toBe("parse-failed")
+  })
+
+  test("missing file yields parse-failed without throwing", async () => {
+    // A lazy-open sink that never received stdout leaves no file on disk.
+    // The parser must treat that as an empty/parse-failed record, not crash.
+    const file = path.join(tmpDir, "does-not-exist.ndjson")
+
+    const r = (await piBuildRunRecordFromFile(file)).finish({ workDir: "/tmp", durationMs: 0 })
+    expect(r.text).toBe("")
+    expect(r.steps).toEqual([])
+    expect(r.runStatus).toBe("parse-failed")
   })
 })
 

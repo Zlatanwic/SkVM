@@ -228,17 +228,18 @@ export function piEventsToRunRecord(events: PiEvent[]): RunRecordBuilder {
  * False positives are harmless (JSON.parse still classifies the event);
  * false negatives are impossible for pi's compact format.
  */
-export function piBuildRunRecordFromNDJSON(output: string): RunRecordBuilder {
-  let lastAgentEnd: Extract<PiEvent, { type: "agent_end" }> | undefined
-  const messageEnds: Extract<PiEvent, { type: "message_end" }>[] = []
+/**
+ * Collects the only pi events the RunRecord builder consumes (agent_end +
+ * message_end). Shared by the string-scanning `piBuildRunRecordFromNDJSON`
+ * and the streaming `piBuildRunRecordFromFile` so both paths apply the same
+ * `includes` pre-filter (the 99.9% noise skip) and the same fallback rules.
+ */
+class PiEventCollector {
+  private lastAgentEnd: Extract<PiEvent, { type: "agent_end" }> | undefined
+  private messageEnds: Extract<PiEvent, { type: "message_end" }>[] = []
 
-  const len = output.length
-  let lineStart = 0
-  for (let i = 0; i <= len; i++) {
-    if (i !== len && output.charCodeAt(i) !== 10 /* \n */) continue
-    const line = lineStart < i ? output.slice(lineStart, i) : ""
-    lineStart = i + 1
-    if (!line.trim()) continue
+  ingestLine(line: string): void {
+    if (!line.trim()) return
     // Pre-filter: only agent_end / message_end feed the builder. Skipping
     // JSON.parse for the other ~99.9% of lines avoids creating tens of
     // thousands of transient objects that would pressure the GC even though
@@ -247,30 +248,77 @@ export function piBuildRunRecordFromNDJSON(output: string): RunRecordBuilder {
       !line.includes('"type":"agent_end"') &&
       !line.includes('"type":"message_end"')
     ) {
-      continue
+      return
     }
     try {
       const e = JSON.parse(line) as PiEvent
       if (e.type === "agent_end") {
-        lastAgentEnd = e
+        this.lastAgentEnd = e
       } else if (e.type === "message_end") {
-        messageEnds.push(e)
+        this.messageEnds.push(e)
       }
     } catch {
       log.debug(`Skipping non-JSON line: ${line.slice(0, 100)}`)
     }
   }
 
-  const messages: PiMessage[] = lastAgentEnd?.messages ? [...lastAgentEnd.messages] : []
-  if (messages.length === 0) {
-    for (const me of messageEnds) {
-      if (me.message.role === "assistant" || me.message.role === "toolResult") {
-        messages.push(me.message)
+  build(): RunRecordBuilder {
+    const messages: PiMessage[] = this.lastAgentEnd?.messages
+      ? [...this.lastAgentEnd.messages]
+      : []
+    if (messages.length === 0) {
+      for (const me of this.messageEnds) {
+        if (me.message.role === "assistant" || me.message.role === "toolResult") {
+          messages.push(me.message)
+        }
       }
     }
+    return piMessagesToRunRecord(messages, this.lastAgentEnd)
+  }
+}
+
+export function piBuildRunRecordFromNDJSON(output: string): RunRecordBuilder {
+  const collector = new PiEventCollector()
+
+  const len = output.length
+  let lineStart = 0
+  for (let i = 0; i <= len; i++) {
+    if (i !== len && output.charCodeAt(i) !== 10 /* \n */) continue
+    const line = lineStart < i ? output.slice(lineStart, i) : ""
+    lineStart = i + 1
+    collector.ingestLine(line)
   }
 
-  return piMessagesToRunRecord(messages, lastAgentEnd)
+  return collector.build()
+}
+
+/**
+ * Streaming variant of `piBuildRunRecordFromNDJSON`: reads the NDJSON
+ * transcript from disk line-by-line instead of materializing the whole stdout
+ * string in memory. Used together with `runSubprocess({ stdoutSink })` — the
+ * subprocess streams its stdout verbatim to the convLog file, and this
+ * function streams it back out, so peak heap is O(longest-line) rather than
+ * O(transcript). For a 0.3–1.7 GB agentic transcript this is the difference
+ * between a 10–32 GB heap (RangeError: Out of memory) and a few MB.
+ */
+export async function piBuildRunRecordFromFile(filePath: string): Promise<RunRecordBuilder> {
+  const collector = new PiEventCollector()
+  const file = Bun.file(filePath)
+  if (!(await file.exists())) return collector.build()
+
+  const decoder = new TextDecoder()
+  let buf = ""
+  for await (const chunk of file.stream() as ReadableStream<Uint8Array>) {
+    buf += decoder.decode(chunk, { stream: true })
+    let nl: number
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      collector.ingestLine(buf.slice(0, nl))
+      buf = buf.slice(nl + 1)
+    }
+  }
+  if (buf) collector.ingestLine(buf) // trailing line without a final \n
+
+  return collector.build()
 }
 
 // ---------------------------------------------------------------------------
