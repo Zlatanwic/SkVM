@@ -7,6 +7,8 @@
  */
 
 import { existsSync } from "node:fs"
+import { mkdir } from "node:fs/promises"
+import path from "node:path"
 
 export interface SubprocessResult {
   exitCode: number
@@ -14,6 +16,9 @@ export interface SubprocessResult {
   stderr: string
   durationMs: number
   timedOut: boolean
+  /** Present (== opts.stdoutSink) when stdout was streamed to disk instead of
+   * buffered into `stdout`. When set, `stdout` is the empty string. */
+  stdoutFile?: string
 }
 
 export interface SubprocessOptions {
@@ -26,6 +31,19 @@ export interface SubprocessOptions {
    * removes that variable from the child's environment.
    */
   env?: Record<string, string | undefined>
+  /**
+   * When set, stream raw stdout bytes verbatim to this file path instead of
+   * buffering them into `result.stdout`. `result.stdout` becomes "" and
+   * `result.stdoutFile` is set to the path. The file is created lazily on
+   * the first non-empty chunk — a child that produces no stdout leaves no
+   * file behind (preserves the old `stdout.trim()` guard in adapters).
+   *
+   * WHY: agentic LLM transcripts (pi/opencode/claude-code) reach 0.3–1.7 GB;
+   * buffering that into a single string drives peak heap to 10–32 GB and
+   * throws `RangeError: Out of memory`. Streaming to the convLog file
+   * collapses the dual-use "write to convLog + parse" into one disk write.
+   */
+  stdoutSink?: string
 }
 
 /**
@@ -115,6 +133,32 @@ export async function runSubprocess(
     }
     return chunks.map((c) => new TextDecoder().decode(c)).join("")
   }
+  // Stream raw stdout bytes verbatim to a file. Lazy-open on the first
+  // non-empty chunk so a child with no stdout leaves no empty file behind.
+  // `finally { writer.end() }` flushes partial content even when the timeout
+  // callback cancels the reader mid-stream (the cancel makes reader.read()
+  // throw, caught above).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const readAllToSink = async (reader: any, sinkPath: string): Promise<void> => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let writer: any
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (!value) continue
+        if (!writer) {
+          await mkdir(path.dirname(sinkPath), { recursive: true })
+          writer = Bun.file(sinkPath).writer()
+        }
+        writer.write(value)
+      }
+    } catch {
+      // reader cancelled (timeout) — partial content already flushed
+    } finally {
+      await writer?.end()
+    }
+  }
   if (opts?.timeoutMs) {
     timer = setTimeout(() => {
       timedOut = true
@@ -132,12 +176,23 @@ export async function runSubprocess(
     }, opts.timeoutMs)
   }
 
+  const sinkPath = opts?.stdoutSink
+  const stdoutPromise = sinkPath
+    ? readAllToSink(stdoutReader, sinkPath).then(() => "")
+    : readAll(stdoutReader)
   const [exitCode, stdout, stderr] = await Promise.all([
     proc.exited.then((code) => { if (timer) clearTimeout(timer); return code }),
-    readAll(stdoutReader),
+    stdoutPromise,
     readAll(stderrReader),
   ])
-  return { exitCode, stdout, stderr, durationMs: Date.now() - start, timedOut }
+  return {
+    exitCode,
+    stdout,
+    stderr,
+    durationMs: Date.now() - start,
+    timedOut,
+    ...(sinkPath ? { stdoutFile: sinkPath } : {}),
+  }
 }
 
 function mergeEnv(
