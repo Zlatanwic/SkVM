@@ -27,6 +27,7 @@ import {
   renderPiBaseUrlOverride,
   renderPiModelRegistration,
 } from "../core/pi-runtime.ts"
+import { startContainer, execInContainer } from "../core/docker-run.ts"
 
 const log = createLogger("pi")
 
@@ -123,6 +124,10 @@ export class PiAdapter implements AgentAdapter {
   private piAgentDir: string | undefined
   /** Cached SDK env overlay derived from the skvm route at setup time. */
   private routeEnv: Record<string, string> = {}
+  /** Cached models.json contents from setup(). Container-mode writes this
+   * into its own sandbox path — cheaper and safer than re-resolving the
+   * route from the pi-side model id (which strips the skvm prefix). */
+  private modelsJson: string | null = null
 
   async setup(config: AdapterConfig): Promise<void> {
     this.timeoutMs = config.timeoutMs ?? TASK_FILE_DEFAULTS.timeoutMs
@@ -197,7 +202,10 @@ export class PiAdapter implements AgentAdapter {
       const doc = route.kind === "openai-compatible"
         ? renderPiModelRegistration(route, modelId)
         : renderPiBaseUrlOverride(route)
-      if (doc) await Bun.write(path.join(root, "models.json"), doc)
+      if (doc) {
+        await Bun.write(path.join(root, "models.json"), doc)
+        this.modelsJson = doc
+      }
     }
 
     log.info(`pi command: ${this.cmdPrefix.join(" ")}`)
@@ -205,6 +213,25 @@ export class PiAdapter implements AgentAdapter {
   }
 
   async run(task: {
+    prompt: string
+    workDir: string
+    skill?: SkillBundle
+    taskId?: string
+    convLog?: import("../core/conversation-logger.ts").ConversationLog
+    timeoutMs?: number
+    /** Terminal-Bench image — when set (and SKVM_PI_HOST_MODE is not), pi
+     * runs inside skvm-pi-runtime with workDir bind-mounted at /app so
+     * model-generated shell commands (find /, grep -r, etc.) execute in a
+     * clean Ubuntu root rather than the Windows Git-Bash host. */
+    tbDockerImage?: string
+  }): Promise<RunResult> {
+    if (task.tbDockerImage && !process.env.SKVM_PI_HOST_MODE) {
+      return this.runInContainer(task)
+    }
+    return this.runOnHost(task)
+  }
+
+  private async runOnHost(task: {
     prompt: string
     workDir: string
     skill?: SkillBundle
@@ -303,6 +330,154 @@ export class PiAdapter implements AgentAdapter {
     })
 
     return builder.finish({ workDir: task.workDir, durationMs, skillLoaded, ...verdict })
+  }
+
+  /**
+   * Container-mode pi: launch skvm-pi-runtime with workDir bind-mounted at
+   * /app, then `docker exec pi …` there. Solves the "find /" host-traversal
+   * timeout by giving pi a real Linux root to walk.
+   *
+   * Preconditions:
+   *   • Docker daemon reachable (probed at startContainer).
+   *   • skvm-pi-runtime:latest built (`docker build -f docker/skvm-pi-runtime.Dockerfile`).
+   *   • task.workDir already seeded with the TB image's /app contents by
+   *     `seedTbAppFiles` in run-condition.ts.
+   *
+   * Non-goals: does NOT run inside `task.tbDockerImage` — that image is the
+   * VERIFIER's runtime and typically lacks node/npm. The agent's runtime is
+   * skvm-pi-runtime; the verifier still runs in tbDockerImage via tb-grade.
+   */
+  private async runInContainer(task: {
+    prompt: string
+    workDir: string
+    skill?: SkillBundle
+    taskId?: string
+    convLog?: import("../core/conversation-logger.ts").ConversationLog
+    timeoutMs?: number
+    tbDockerImage?: string
+  }): Promise<RunResult> {
+    let skillLoaded: boolean | undefined
+    let skillDirInContainer: string | undefined
+
+    // Skill staging is the SAME as host mode — files live under workDir and
+    // the container sees them at /app/AGENTS.md or /app/.pi-skills/<name>.
+    if (task.skill) {
+      if (task.skill.mode === "inject") {
+        await Bun.write(path.join(task.workDir, "AGENTS.md"), task.skill.content)
+        skillLoaded = false
+      } else {
+        const skillName = task.skill.meta.name
+        const hostSkillDir = path.join(task.workDir, ".pi-skills", skillName)
+        await mkdir(hostSkillDir, { recursive: true })
+        await Bun.write(path.join(hostSkillDir, "SKILL.md"), task.skill.content)
+        skillDirInContainer = `/app/.pi-skills/${skillName}`
+        skillLoaded = false
+      }
+    }
+
+    // PI_CODING_AGENT_DIR: pi's config sandbox. Put it inside workDir so it
+    // auto-mounts with the volume; models.json for the route override goes
+    // here just like host mode.
+    const sandboxRel = `.pi-sandbox`
+    const hostSandbox = path.join(task.workDir, sandboxRel)
+    await mkdir(hostSandbox, { recursive: true })
+    const containerSandbox = `/app/${sandboxRel}`
+
+    // Managed mode: reuse the models.json emitted at setup(). Native mode
+    // has no models.json (auth comes from the user's real ~/.pi/agent dir on
+    // the host) and would need extra work to bind-mount that — bench always
+    // uses managed mode, so leaving native container-mode for later is fine.
+    if (this.mode === "managed" && this.modelsJson) {
+      await Bun.write(path.join(hostSandbox, "models.json"), this.modelsJson)
+    }
+
+    const startMs = performance.now()
+    const timeoutMs = task.timeoutMs ?? this.timeoutMs
+
+    // API keys and PI_CODING_AGENT_DIR are the env the container needs.
+    // Route env vars (LONGCAT_API_KEY / DEEPSEEK_API_KEY / …) came from
+    // envForRoute() at setup time.
+    const env: Record<string, string> = {
+      ...this.routeEnv,
+      PI_CODING_AGENT_DIR: containerSandbox,
+    }
+
+    const container = await startContainer({
+      image: "skvm-pi-runtime:latest",
+      mounts: [{ host: task.workDir, container: "/app", mode: "rw" }],
+      env,
+      workDir: "/app",
+      // Lifetime > task timeout so cleanup can rm -f cleanly even after a kill.
+      lifetimeMs: timeoutMs + 60_000,
+    })
+
+    try {
+      const prompt = `IMPORTANT: Do not ask clarifying questions. Proceed directly with implementation. Execute all steps immediately without waiting for user input.\n\n${task.prompt}`
+
+      const piCmd = [
+        "pi",
+        "-p", prompt,
+        "--mode", "json",
+        "--no-session",
+        "--model", this.model,
+        "--tools", "read,bash,edit,write",
+        "--no-extensions",
+      ]
+      if (task.skill?.mode === "discover" && skillDirInContainer) {
+        piCmd.push("--skill", skillDirInContainer, "--no-skills", "--no-context-files")
+      } else if (!task.skill) {
+        piCmd.push("--no-context-files", "--no-skills")
+      }
+      piCmd.push(...this.extraCliArgs)
+
+      log.info(`pi (container): image=skvm-pi-runtime:latest container=${container.name} model=${this.model}`)
+
+      const convLogPath = task.convLog?.filePath
+      const { stdout, stderr, exitCode, timedOut } = await execInContainer({
+        cmd: piCmd,
+        container,
+        cwd: "/app",
+        timeoutMs,
+        stdoutSink: convLogPath,
+      })
+
+      const durationMs = performance.now() - startMs
+
+      if (exitCode !== 0 && stderr) {
+        log.warn(`pi (container) exited with code ${exitCode}: ${stderr.slice(0, 200)}`)
+      }
+
+      const builder = convLogPath
+        ? await piBuildRunRecordFromFile(convLogPath)
+        : piBuildRunRecordFromNDJSON(stdout)
+
+      if (task.skill && skillLoaded === false) {
+        const skillSnippet = task.skill.content.replace(/^#.*\n/m, "").trim().slice(0, 60)
+        if (task.skill.mode === "inject" && builder.stepCount > 0) {
+          skillLoaded = true
+        }
+        if (!skillLoaded && skillSnippet.length > 20) {
+          for (const step of builder.stepsSoFar) {
+            if (step.role === "assistant" && step.text?.includes(skillSnippet)) {
+              skillLoaded = true
+              break
+            }
+          }
+        }
+      }
+
+      const verdict = await subprocessVerdict({
+        label: "pi",
+        timedOut,
+        exitCode,
+        timeoutMs,
+        stderr,
+      })
+
+      return builder.finish({ workDir: task.workDir, durationMs, skillLoaded, ...verdict })
+    } finally {
+      await container.cleanup()
+    }
   }
 
   async teardown(): Promise<void> {
