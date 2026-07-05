@@ -602,6 +602,16 @@ export interface AgentAdapter {
     convLog?: ConversationLog
     /** Per-task timeout override (ms). Falls back to adapter setup timeout. */
     timeoutMs?: number
+    /**
+     * When set, the task originates from a Terminal-Bench import and carries
+     * the image whose `/app` the verifier will mount workDir into. Container-
+     * aware adapters (currently only pi) MAY run their agent inside a
+     * container against this workDir so model-generated shell commands (e.g.
+     * `find /`) execute in a real Linux root instead of the Windows host via
+     * MSYS. Non-container adapters ignore the field. Set `SKVM_PI_HOST_MODE=1`
+     * to force the host path for debugging.
+     */
+    tbDockerImage?: string
   }): Promise<RunResult>
   teardown(): Promise<void>
 }
