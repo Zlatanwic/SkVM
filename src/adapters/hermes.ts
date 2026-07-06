@@ -425,8 +425,17 @@ export class HermesAdapter implements AgentAdapter {
       }
     }
 
-    // --- Parse session_id from stdout ---
-    const sessionIdMatch = stdout.match(/\nsession_id:\s*(\S+)\s*$/)
+    // --- Parse session_id from stderr ---
+    // Hermes CLI (0.18.0 at least; verified against skvm-hermes-runtime:latest)
+    // writes the `session_id: <id>` trailer to STDERR, not stdout — regardless
+    // of exit code. Empirically confirmed with -Q --source=tool: stdout carries
+    // only the tirith banner + agent's final reply, stderr carries a blank
+    // line followed by `session_id: YYYYMMDD_HHMMSS_hexhash`. Reading stdout
+    // was a latent bug — silently degrades to reduced-telemetry on every run;
+    // uncovered while wiring the container branch (which forced attention on
+    // tokens/cost being n/a). Container branch reads the same regex against
+    // its own stderr.
+    const sessionIdMatch = stderr.match(/\nsession_id:\s*(\S+)\s*$/)
     const sessionId = sessionIdMatch?.[1]
 
     if (!sessionId) {
@@ -699,7 +708,11 @@ export class HermesAdapter implements AgentAdapter {
         }
       }
 
-      const sessionIdMatch = stdout.match(/\nsession_id:\s*(\S+)\s*$/)
+      // Hermes writes `session_id: <id>` to STDERR (not stdout). See the
+      // parallel comment on the host branch above. In container mode stdout
+      // may have been streamed to disk via stdoutSink; stderr always stays
+      // in-memory on the execInContainer result.
+      const sessionIdMatch = stderr.match(/\nsession_id:\s*(\S+)\s*$/)
       const sessionId = sessionIdMatch?.[1]
 
       if (!sessionId) {
