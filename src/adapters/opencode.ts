@@ -712,7 +712,7 @@ export class OpenCodeAdapter implements AgentAdapter {
     try {
       const prompt = `IMPORTANT: Do not ask clarifying questions. Proceed directly with implementation. Execute all steps immediately without waiting for user input.\n\n${task.prompt}`
 
-      const agentFlag = this.mode === "native" ? this.nativeAgent : "build"
+      const agentFlag = this.mode === "managed" ? "build" : this.nativeAgent
       const opencodeCmd = [
         "opencode",
         "run",

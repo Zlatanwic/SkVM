@@ -10,9 +10,15 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# CN mirror over HTTP to survive local DNS split-tunnel routing. Same rationale
-# as skvm-pi-runtime — see that Dockerfile for the full explanation.
-RUN sed -i 's|http://archive.ubuntu.com|http://mirrors.aliyun.com|g; s|http://security.ubuntu.com|http://mirrors.aliyun.com|g; s|https://mirrors.aliyun.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+# Dual apt source: official archive (always reachable, fallback) + aliyun
+# mirror (fast in CN, primary). apt aggregates both stanzas and pulls from
+# whichever responds. Hardens against the vpnkit DNS hijack incident where
+# aliyun.com got routed to fake IPs (198.18.0.x) and the build failed at
+# apt-get update — see skvm-hermes-runtime.Dockerfile for the incident.
+# Adding aliyun as a second DEB822 stanza (not a separate .list file)
+# avoids apt's "configured multiple times" warning when the same suite
+# appears in two sources.
+RUN printf '\nTypes: deb\nURIs: http://mirrors.aliyun.com/ubuntu/\nSuites: noble noble-updates noble-security\nComponents: main restricted universe multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' >> /etc/apt/sources.list.d/ubuntu.sources
 
 # Base tooling opencode's bash tool commonly needs. Kept minimal — the task's
 # own docker image supplies task-specific deps.

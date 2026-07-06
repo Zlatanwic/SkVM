@@ -9,11 +9,15 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# CN mirror over HTTP to survive local DNS split-tunnel routing (198.18.0.x
-# hijacking). Base ubuntu:24.04 has no ca-certificates, so HTTPS handshake
-# fails until we install them; use HTTP for the initial apt cycle then
-# switch to HTTPS. Aliyun mirror is stable in-region without SSL requirement.
-RUN sed -i 's|http://archive.ubuntu.com|http://mirrors.aliyun.com|g; s|http://security.ubuntu.com|http://mirrors.aliyun.com|g; s|https://mirrors.aliyun.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+# Dual apt source: official archive (always reachable, fallback) + aliyun
+# mirror (fast in CN, primary). apt aggregates both stanzas and pulls from
+# whichever responds. Hardens against the vpnkit DNS hijack incident where
+# aliyun.com got routed to fake IPs (198.18.0.x) and the build failed at
+# apt-get update — see skvm-hermes-runtime.Dockerfile for the incident.
+# Adding aliyun as a second DEB822 stanza (not a separate .list file)
+# avoids apt's "configured multiple times" warning when the same suite
+# appears in two sources.
+RUN printf '\nTypes: deb\nURIs: http://mirrors.aliyun.com/ubuntu/\nSuites: noble noble-updates noble-security\nComponents: main restricted universe multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' >> /etc/apt/sources.list.d/ubuntu.sources
 
 # Base tooling that pi's bash tool commonly needs (find, grep, sqlite3, python3,
 # xxd, curl, git, jq). Kept minimal — TB tasks that need heavier deps are
