@@ -26,16 +26,43 @@ const log = createLogger("compiler-agent")
 // byte-for-byte, so guard check #2 passes by construction.
 // ---------------------------------------------------------------------------
 
-const CODE_BLOCK_RE = /```(\w*)\n([\s\S]*?)```/g
+const CODE_FENCE_OPEN_RE = /^[ \t]{0,3}(`{3,}|~{3,})[^\r\n]*\r?\n/gm
 const codeBlockToken = (i: number): string => `[[SKVM_CODE_BLOCK_${i}]]`
 
 export function maskCodeBlocks(text: string): { masked: string; blocks: string[] } {
   const blocks: string[] = []
-  const masked = text.replace(CODE_BLOCK_RE, (match) => {
+  let masked = ""
+  let copyFrom = 0
+  let searchFrom = 0
+
+  for (;;) {
+    CODE_FENCE_OPEN_RE.lastIndex = searchFrom
+    const opening = CODE_FENCE_OPEN_RE.exec(text)
+    if (!opening) break
+
+    const fence = opening[1]!
+    const fenceChar = fence[0]!
+    const closingRe = new RegExp(
+      `^[ \\t]{0,3}${fenceChar}{${fence.length},}[ \\t]*(?=\\r?$)`,
+      "gm",
+    )
+    closingRe.lastIndex = CODE_FENCE_OPEN_RE.lastIndex
+    const closing = closingRe.exec(text)
+    if (!closing) {
+      // An unmatched opening fence is prose, not a maskable code block.
+      searchFrom = CODE_FENCE_OPEN_RE.lastIndex
+      continue
+    }
+
+    const blockEnd = closing.index + closing[0].length
     const token = codeBlockToken(blocks.length)
-    blocks.push(match)
-    return token
-  })
+    masked += text.slice(copyFrom, opening.index) + token
+    blocks.push(text.slice(opening.index, blockEnd))
+    copyFrom = blockEnd
+    searchFrom = blockEnd
+  }
+
+  masked += text.slice(copyFrom)
   return { masked, blocks }
 }
 
@@ -44,8 +71,19 @@ export function unmaskCodeBlocks(text: string, blocks: string[]): string {
   const dropped: string[] = []
   blocks.forEach((block, i) => {
     const token = codeBlockToken(i)
-    if (out.includes(token)) {
-      out = out.split(token).join(block) // literal replace; avoids regex $ pitfalls
+    const first = out.indexOf(token)
+    if (first >= 0) {
+      const before = out.slice(0, first)
+      const after = out.slice(first + token.length)
+      const duplicateCount = after.split(token).length - 1
+      if (duplicateCount > 0) {
+        log.warn(
+          `Compiler agent duplicated code-block placeholder ${token} ${duplicateCount} time(s); removing duplicates`,
+        )
+      }
+      // Restore exactly once. Remove later copies of the token rather than
+      // expanding the same original block multiple times.
+      out = before + block + after.split(token).join("")
     } else {
       dropped.push(block)
     }
@@ -514,7 +552,12 @@ export async function runPass1Agentic(
   let compiledSkill: string
   if (await compiledSkillFile.exists()) {
     const written = await compiledSkillFile.text()
-    compiledSkill = unmaskCodeBlocks(written, blocks)
+    if (written === masked) {
+      log.warn("Compiler agent left SKILL.md unchanged — using original")
+      compiledSkill = skillContent
+    } else {
+      compiledSkill = unmaskCodeBlocks(written, blocks)
+    }
   } else {
     log.warn("Compiler agent did not write SKILL.md — using original")
     compiledSkill = skillContent
