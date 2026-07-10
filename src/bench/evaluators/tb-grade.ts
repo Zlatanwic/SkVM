@@ -29,7 +29,7 @@ const log = createLogger("tb-grade")
 
 interface TbGradePayload {
   dockerImage: string
-  /** Path to tests/ — absolute (stamped by importer) or relative to taskDir. */
+  /** Absolute path to tests/, stamped by the Terminal-Bench importer. */
   testsDir: string
   /** Always set by resolvePayload (defaults to 1200). */
   verifierTimeoutSec: number
@@ -51,8 +51,8 @@ async function docker(args: string[], opts?: { timeoutMs?: number }): Promise<{ 
   })
 }
 
-/** Parse the payload; resolve a relative testsDir against the task dir. */
-function resolvePayload(payload: unknown, taskDir: string | undefined): TbGradePayload | { error: string } {
+/** Parse the payload and enforce the importer's absolute testsDir contract. */
+function resolvePayload(payload: unknown): TbGradePayload | { error: string } {
   if (typeof payload !== "object" || payload === null) {
     return { error: "tb-grade: criterion.payload missing (expected {dockerImage, testsDir})" }
   }
@@ -63,23 +63,21 @@ function resolvePayload(payload: unknown, taskDir: string | undefined): TbGradeP
   if (typeof p.testsDir !== "string" || !p.testsDir) {
     return { error: "tb-grade: payload.testsDir missing" }
   }
-  const testsDir = path.isAbsolute(p.testsDir) || !taskDir
-    ? p.testsDir
-    : path.resolve(taskDir, p.testsDir)
+  if (!path.isAbsolute(p.testsDir)) {
+    return { error: "tb-grade: payload.testsDir must be an absolute path" }
+  }
   const verifierTimeoutSec = typeof p.verifierTimeoutSec === "number" && p.verifierTimeoutSec > 0
     ? p.verifierTimeoutSec
     : 1200
-  return { dockerImage: p.dockerImage, testsDir, verifierTimeoutSec }
+  return { dockerImage: p.dockerImage, testsDir: p.testsDir, verifierTimeoutSec }
 }
 
 export const tbGrade: CustomEvaluator = {
   async run({ criterion, runResult }) {
     const workDir = runResult.workDir
-    // taskDir isn't in CustomEvalContext; the importer stamps an ABSOLUTE
-    // tbTestsDir into payload.testsDir, so resolution doesn't need it. The
-    // taskDir param below stays undefined and is only used if a relative path
-    // somehow slips through (defensive).
-    const resolved = resolvePayload(criterion.payload, undefined)
+    // CustomEvalContext has no taskDir, so the importer stamps an absolute
+    // testsDir into the payload before task.json is serialized.
+    const resolved = resolvePayload(criterion.payload)
     if ("error" in resolved) {
       return { pass: false, score: 0.0, details: resolved.error }
     }
@@ -164,7 +162,7 @@ export const tbGrade: CustomEvaluator = {
   },
 
   async checkIntegrity(criterion) {
-    const resolved = resolvePayload(criterion.payload, undefined)
+    const resolved = resolvePayload(criterion.payload)
     if ("error" in resolved) return { ok: false, reason: resolved.error }
     return { ok: true }
   },

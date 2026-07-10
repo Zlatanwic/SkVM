@@ -28,7 +28,7 @@ async function seedTbAppFiles(task: BenchTask, workDir: string): Promise<void> {
   // the mounted host workDir. --rm tears the throwaway container down at exit.
   const r = await runSubprocess(
     ["docker", "run", "--rm", "-v", `${workDir}:/out`, task.tbDockerImage,
-     "sh", "-c", "cp -r /app/. /out/ 2>/dev/null; true"],
+     "sh", "-c", "cp -r /app/. /out/ 2>/dev/null"],
     { timeoutMs: 120000, env: { MSYS_NO_PATHCONV: "1" } },
   )
   if (r.exitCode !== 0) {

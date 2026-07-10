@@ -112,6 +112,17 @@ export async function loadTasks(opts?: {
 // Write Task
 // ---------------------------------------------------------------------------
 
+/** Ensure the canonical task directory exists without serializing task.json. */
+export async function ensureTaskDir(
+  taskId: string,
+  opts?: { tasksDir?: string },
+): Promise<string> {
+  const tasksDir = opts?.tasksDir ?? TASKS_DIR
+  const taskDir = path.join(tasksDir, taskId)
+  await mkdir(taskDir, { recursive: true })
+  return taskDir
+}
+
 /**
  * Write a BenchTask to the folder-based native format.
  * Creates: <tasksDir>/<id>/task.json, grade.py, fixtures/
@@ -121,9 +132,7 @@ export async function writeTask(
   task: BenchTask,
   opts?: { tasksDir?: string },
 ): Promise<string> {
-  const tasksDir = opts?.tasksDir ?? TASKS_DIR
-  const taskDir = path.join(tasksDir, task.id)
-  await mkdir(taskDir, { recursive: true })
+  const taskDir = await ensureTaskDir(task.id, opts)
 
   const filePath = path.join(taskDir, "task.json")
 

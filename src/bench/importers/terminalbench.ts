@@ -25,11 +25,11 @@
  */
 
 import path from "node:path"
-import { readdir, mkdir, copyFile } from "node:fs/promises"
+import { chmod, copyFile, mkdir, readdir, stat } from "node:fs/promises"
 import { parse as parseToml } from "smol-toml"
 import type { EvalCriterion } from "../../core/types.ts"
 import type { BenchTask } from "../types.ts"
-import { writeTask } from "../loader.ts"
+import { ensureTaskDir, writeTask } from "../loader.ts"
 import { createLogger } from "../../core/logger.ts"
 import { TASK_FILE_DEFAULTS } from "../../core/ui-defaults.ts"
 
@@ -156,8 +156,20 @@ async function convertTask(taskDir: string, dirName: string): Promise<BenchTask 
   return benchTask
 }
 
-/** Copy tests/ into the freshly written task dir, normalising CRLF→LF. */
-async function copyTestsNormalized(srcTestsDir: string, destTestsDir: string): Promise<void> {
+const TEXT_TEST_EXTENSIONS = new Set([
+  ".css", ".csv", ".html", ".js", ".json", ".md", ".py", ".sh",
+  ".toml", ".ts", ".txt", ".xml", ".yaml", ".yml",
+])
+
+/**
+ * Copy tests/ into the task dir. Known text files get CRLF→LF normalization;
+ * all other files are copied byte-for-byte. Source permission bits are
+ * restored in both cases so executable verifier helpers stay executable.
+ */
+export async function copyTestsNormalized(
+  srcTestsDir: string,
+  destTestsDir: string,
+): Promise<void> {
   await mkdir(destTestsDir, { recursive: true })
   const entries = await readdir(srcTestsDir, { withFileTypes: true })
   for (const entry of entries) {
@@ -166,9 +178,14 @@ async function copyTestsNormalized(srcTestsDir: string, destTestsDir: string): P
     if (entry.isDirectory()) {
       await copyTestsNormalized(src, dest)
     } else if (entry.isFile()) {
-      // Normalise CRLF→LF so the Linux container's bash can run test.sh.
-      const raw = await Bun.file(src).text()
-      await Bun.write(dest, raw.replace(/\r\n/g, "\n"))
+      if (TEXT_TEST_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
+        const raw = await Bun.file(src).text()
+        await Bun.write(dest, raw.replace(/\r\n/g, "\n"))
+      } else {
+        await copyFile(src, dest)
+      }
+      const sourceMode = (await stat(src)).mode & 0o777
+      await chmod(dest, sourceMode)
     }
   }
 }
@@ -180,7 +197,7 @@ async function copyTestsNormalized(srcTestsDir: string, destTestsDir: string): P
  */
 export async function importTerminalBench(
   repoDir: string,
-  opts?: { excludedTasks?: string[]; tasks?: string[] },
+  opts?: { excludedTasks?: string[]; tasks?: string[]; tasksDir?: string },
 ): Promise<{ imported: string[]; skipped: string[]; errors: string[] }> {
   const tasksRoot = path.join(repoDir, "tasks")
   const excluded = new Set(opts?.excludedTasks ?? [])
@@ -219,8 +236,10 @@ export async function importTerminalBench(
         continue
       }
 
-      const outDir = await writeTask(benchTask, {})
-      // writeTask created <tasksDir>/<id>/; copy tests/ in next to task.json.
+      // Create the canonical directory without writing an intermediate
+      // task.json whose paths are still relative.
+      const writeOpts = opts?.tasksDir ? { tasksDir: opts.tasksDir } : undefined
+      const outDir = await ensureTaskDir(benchTask.id, writeOpts)
       await copyTestsNormalized(path.join(taskDir, "tests"), path.join(outDir, "tests"))
       // Stamp ABSOLUTE paths now that the dir exists — both the task-level
       // tbTestsDir and the evaluator payload's testsDir. The evaluator
@@ -232,7 +251,7 @@ export async function importTerminalBench(
       if (tbCriterion && tbCriterion.method === "custom" && tbCriterion.payload) {
         ;(tbCriterion.payload as Record<string, unknown>).testsDir = absTestsDir
       }
-      await writeTask(benchTask, {})
+      await writeTask(benchTask, writeOpts)
 
       imported.push(`${dirName} -> ${outDir}`)
       log.debug(`Imported: ${dirName}`)
